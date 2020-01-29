@@ -11,7 +11,7 @@ setuptools.setup(
     version="0.0.1",
     author="Shane Breeze",
     author_email="sdb15@ic.ac.uk",
-    scripts=[],
+    scripts=["scripts/process_tables.py"],
     description="Zinv analysis querying",
     long_description=long_description,
     long_description_content_type="text/markdown",

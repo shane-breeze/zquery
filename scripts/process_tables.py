@@ -41,6 +41,18 @@ def main():
     with open(options.cfg, 'r') as f:
         cfg = yaml.safe_load(f)
 
+    options.modules = options.modules.split(",")
+    options.paths = options.paths.split(",")
+    options.pysge_args = options.pysge_args.split(",")
+
+    kwargs = {}
+    if len(options.pysge_kwargs) > 0:
+        kwargs.update(dict(
+            tuple(kw.split(":"))
+            for kw in options.pysge_kwargs.split(",")
+        ))
+    options.pysge_kwargs = kwargs
+
     if options.print_modules:
         print(",".join(cfg.keys()))
         return
