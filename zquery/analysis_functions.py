@@ -42,7 +42,8 @@ def basic_query(path, *cfgs):
 def basic_eval(path, *cfgs):
     for cfg in cfgs:
         df = pd.read_hdf(path, cfg["input"])
-        df.eval(cfg["eval"], inplace=True)
+        for eval_str in cfg["evals"]:
+            df.eval(eval_str, inplace=True)
         df.to_hdf(
             path, cfg["output"], format='fixed', append=False,
             complib='zlib', complevel=9,
