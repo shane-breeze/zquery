@@ -1,9 +1,15 @@
+import os
 import numpy as np
 import pandas as pd
 import scipy.special
+import uproot
+import oyaml as yaml
+
 from . import geometry
 
 __all__ = [
+    "create_hdf_from_root",
+    "convert",
     "convert_table_to_fixed",
     "basic_query",
     "basic_eval",
@@ -13,7 +19,56 @@ __all__ = [
     "object_cross_dphi",
     "mindphi",
     "weight_sigmoid",
+    "object_groupby",
+    "histogram",
 ]
+
+def create_hdf_from_root(path, *cfgs):
+    for cfg in cfgs:
+        outpath = os.path.join(
+            cfg["output"]["direc"],
+            os.path.splitext(os.path.basename(path))[0]+".h5",
+        )
+        if os.path.exists(outpath):
+            os.remove(outpath)
+
+    for cfg in cfgs:
+        with open(cfg["dataset"]["cfg"], 'r') as f:
+            dataset_cfg = yaml.safe_load(f)["datasets"]
+
+        # find cfg for current path
+        path_cfg = None
+        for dataset in dataset_cfg:
+            if path in dataset["files"]:
+                path_cfg = dataset
+                break
+
+        outpath = os.path.join(
+            cfg["output"]["direc"],
+            os.path.splitext(os.path.basename(path))[0]+".h5",
+        )
+
+        for df in uproot.pandas.iterate(path, cfg["tree"], **cfg["iterate_kwargs"]):
+            df = df.astype(cfg.get("dtypes", {}))
+
+            for key in cfg["dataset"]["keys"]:
+                df[key] = path_cfg[key]
+
+            df.to_hdf(
+                outpath, cfg["output"]["tree"],
+                format='table', append=True,
+                complib='zlib', complevel=9,
+            )
+
+def convert(path, trees, outdir, kwargs):
+    for tree in trees:
+        new_path = os.path.join(
+            outdir, os.path.basename(path),
+        )
+        pd.read_hdf(path, tree).to_hdf(
+            new_path, tree,
+            **kwargs,
+        )
 
 def convert_table_to_fixed(path, *tables):
     """Simply read in a dataframe and output as a fixed table for quicker IO"""
@@ -33,8 +88,17 @@ def convert_table_to_fixed(path, *tables):
 def basic_query(path, *cfgs):
     """Apply a query string to a dataframe and output into the same file"""
     for cfg in cfgs:
-        df = pd.read_hdf(path, cfg["input"])
-        df.query(cfg["query"]).reset_index(drop=True).to_hdf(
+        df = (
+            pd.read_hdf(path, cfg["input"])
+            .query(cfg["query"])
+            .reset_index(drop=True)
+        )
+
+        # Reset object_id for tables with multiple parent_event rows
+        if "object_id" in df.columns:
+            df["object_id"] = df.groupby("parent_event", sort=False).cumcount()
+
+        df.to_hdf(
             path, cfg["output"], format='fixed', append=False,
             complib='zlib', complevel=9,
         )
@@ -79,20 +143,21 @@ def object_cross_cleaning(path, *cfgs):
     """
     for cfg in cfgs:
         # Retain the original dataframe for writing the skimmed version out
-        df_orig = pd.read_hdf(path, cfg["input"])
+        df_orig = pd.read_hdf(path, cfg["input"]["table"])
         df = df_orig[[
             "parent_event", "object_id",
-            cfg["columns"].format("eta"),
-            cfg["columns"].format("phi"),
+            cfg["input"]["table"].format("eta"),
+            cfg["input"]["table"].format("phi"),
         ]].sort_values(["parent_event", "object_id"]).copy(deep=True)
         df.columns = ["parent_event", "object_id1", "eta1", "phi1"]
         df["matched"] = False
 
         for cfg_ref in cfg["references"]:
-            df_ref = pd.read_hdf(path, cfg_ref["table"])[[
+            df_ref = pd.read_hdf(path, cfg_ref["table"])
+            df_ref = df_ref.query(cfg_ref["query"])[[
                 "parent_event", "object_id",
-                cfg_ref["columns"].format("eta"),
-                cfg_ref["columns"].format("phi"),
+                cfg_ref["variable"].format("eta"),
+                cfg_ref["variable"].format("phi"),
             ]].sort_values(["parent_event", "object_id"])
             df_ref.columns = ["parent_event", "object_id2", "eta2", "phi2"]
 
@@ -103,18 +168,20 @@ def object_cross_cleaning(path, *cfgs):
             )
 
             # Remove warnings by making sure nans fail. I.e. inf < 0.4 is always
-            # true
+            # False
             dr[np.isnan(dr)] = np.inf
-            df_cross["matched"] = (df < cfg["distance"])
+            df_cross["matched"] = (dr < cfg["distance"])
 
             # Default set to no match (False) and then take the logical OR with
             # any matched object of this particular reference
             df["matched"] = df["matched"] | (
-                df_cross.groupby(["parent_event", "object_id1"])["matched"].any().values
+                df_cross.groupby(["parent_event", "object_id1"], sort=False)["matched"]
+                .any().values
             )
 
-        df_orig.loc[df["matched"],:].reset_index(drop=True).to_hdf(
-            path, cfg["output"], format='fixed', append=False,
+        df_orig[cfg["output"]["variable"]] = (~df["matched"])
+        df_orig.to_hdf(
+                path, cfg["output"]["table"], format='fixed', append=False,
             complib='zlib', complevel=9,
         )
 
@@ -133,7 +200,8 @@ def shift_2dvector(path, **kwargs):
         )
 
         for cfg_shift in cfg["shifters"]:
-            df_shift = pd.read_hdf(path, cfg_shift["table"])
+            df_shift = pd.read_hdf(path, cfg_shift["table"]["name"])
+            df_shift = df_shift.query(cfg_shift["table"]["query"])
             df_shift["pt"] = df_shift.eval(cfg_shift["variables"]["pt"])
             df_shift["phi"] = df_shift.eval(cfg_shift["variables"]["phi"])
             df_shift = df_shift[["parent_event", "object_id", "pt", "phi"]].copy(deep=True)
@@ -147,7 +215,7 @@ def shift_2dvector(path, **kwargs):
             # Not all events have the objects leading to a mismatch in the
             # index between df_shift and df. Fixed by the reindex
             df_shift = (
-                df_shift.groupby("parent_event")[["px", "py"]].sum()
+                df_shift.groupby("parent_event", sort=False)[["px", "py"]].sum()
                 .reindex(df.index, fill_value=0.)
             )
 
@@ -207,7 +275,7 @@ def mindphi(path, *cfgs):
         df.columns = ["parent_event", "object_id", "variable"]
 
         mask = (df["object_id"]<cfg["nobj"])
-        df_min = df.loc[mask,:].groupby("parent_event").min()
+        df_min = df.loc[mask,:].groupby("parent_event", sort=False).min()
 
         df_min = df_min.reindex(df_orig.index)
         df_orig[cfg["output"]["variable"]] = df_min["variable"]
@@ -271,3 +339,59 @@ def weight_sigmoid(path, *cfgs):
             complib='zlib', complevel=9,
         )
 
+def object_groupby(path, *cfgs):
+    for cfg in cfgs:
+        df_orig = pd.read_hdf(path, cfg["output"]["table"])
+
+        df = pd.read_hdf(path, cfg["input"]["table"])[[
+            "parent_event", "object_id", *cfg["input"]["variables"],
+        ]]
+        df = (
+            df.query(cfg["query"])
+            .groupby("parent_event", sort=False)
+            .agg(cfg["agg"])
+            .reindex(df_orig.index)
+            .drop("object_id", axis=1)
+            .fillna(cfg["fillna"])
+        )
+        df.columns = cfg["output"]["variables"]
+        df = df.astype(cfg["dtype"])
+
+        for col in cfg["output"]["variables"]:
+            df_orig[col] = df.loc[:,col]
+
+        df_orig.to_hdf(
+            path, cfg["output"]["table"], format='fixed', append=False,
+            complib='zlib', complevel=9,
+        )
+
+def _df_merge(df1, df2):
+    if df1 is None or df1.empty:
+        return df2
+    if df2 is None or df2.empty:
+        return df1
+
+    reindex = df1.index.union(df2.index)
+    return df1.reindex(reindex).fillna(0.) + df2.reindex(reindex).fillna(0.)
+
+def histogram(path, **kwargs):
+    df_hist = pd.DataFrame()
+    for df in pd.read_hdf(path, **kwargs["input"]):
+        if "lambdas" in kwargs:
+            for key, func in kwargs["lambdas"].items():
+                df[key] = eval(f'lambda {func}')(df)
+
+        if "evals" in kwargs:
+            df.eval("\n".join(kwargs["evals"]), inplace=True)
+
+        for cfg in kwargs["cfgs"]:
+            for keymap in cfg["eval_keys"]:
+                if "lambdas" in cfg:
+                    for key, func in cfg["lambdas"].items():
+                        df[key] = eval('lambda {}'.format(func.format(**keymap)))(df)
+                if "evals" in cfg:
+                    df.eval("\n".join(cfg["evals"]).format(**keymap), inplace=True)
+                tdf = df.loc[:,cfg["columns"]]
+                tdf = tdf.groupby(cfg["groupby"]).agg(cfg["agg"])
+                df_hist = _df_merge(df_hist, tdf)
+    return df_hist
