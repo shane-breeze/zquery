@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import argparse
-import oyaml as yaml
+import os
+import yaml
+import importlib
 
 from zquery import process_tables
 
@@ -29,22 +31,34 @@ def parse_args():
         "--verbose", "-v", default=False, action="store_true",
         help="Verbose print out whilst running",
     )
-    parser.add_argument(
-        "--print-modules", default=False, action="store_true",
-        help="Print available modules",
-    )
     return parser.parse_args()
+
+def read_yaml(path, delimiter=','):
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            info = yaml.safe_load(f)
+    else:
+        info = path
+
+    if isinstance(info, str):
+        info = info.split(delimiter)
+
+    return info
 
 def main():
     options = parse_args()
 
-    with open(options.cfg, 'r') as f:
-        cfg = yaml.safe_load(f)
+    options.cfg = read_yaml(options.cfg)
+    options.modules = read_yaml(options.modules)
+    options.paths = read_yaml(options.paths)
 
-    options.modules = options.modules.split(",")
-    options.paths = options.paths.split(",")
+    for key, process in options.cfg.items():
+        module_name, func_name = process["func"].split(":")
+        imported_module = importlib.import_module(module_name)
+        func = getattr(imported_module, func_name)
+        process["func"] = func
+
     options.pysge_args = options.pysge_args.split(",")
-
     kwargs = {}
     if len(options.pysge_kwargs) > 0:
         kwargs.update(dict(
@@ -53,12 +67,6 @@ def main():
         ))
     options.pysge_kwargs = kwargs
 
-    if options.print_modules:
-        print(",".join(cfg.keys()))
-        return
-
-    options.cfg = cfg
-    del options.print_modules
     results = process_tables(**vars(options))
 
 if __name__ == "__main__":
